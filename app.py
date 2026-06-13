@@ -47,23 +47,29 @@ def get_db():
 
 @st.cache_data(ttl=30)  # Cache for 30 seconds
 def fetch_categories():
-    """Fetch all batch categories."""
+    """Fetch all batch categories. Uses 'name' field if available, otherwise 'title' field."""
     db = get_db()
     categories = list(db.batchcategories.find(
         {},
         {"_id": 1, "name": 1, "title": 1}
     ))
     
-    # Filter out testing categories
-    categories = [c for c in categories if c.get('name') and 'testing' not in c.get('name', '').lower()]
-    
-    return pd.DataFrame([
-        {
+    # Build category list using name first, fallback to title
+    cat_list = []
+    for c in categories:
+        # Get the best name: name -> title -> Unknown
+        cat_name = c.get('name') or c.get('title') or 'Unknown'
+        
+        # Skip testing categories
+        if 'testing' in cat_name.lower():
+            continue
+        
+        cat_list.append({
             'category_id': str(c['_id']),
-            'category_name': c.get('name', 'Unknown')
-        }
-        for c in categories
-    ])
+            'category_name': cat_name
+        })
+    
+    return pd.DataFrame(cat_list)
 
 @st.cache_data(ttl=30)
 def fetch_batches():
@@ -71,22 +77,30 @@ def fetch_batches():
     db = get_db()
     
     pipeline = [
+        # Filter out batches without batchCategoryId (must have a valid value)
         {
             "$match": {
-                "batchCategoryId": {"$exists": True, "$ne": None, "$ne": ""}
+                "batchCategoryId": {"$exists": True, "$nin": [None, ""]}
             }
         },
+        # Convert string batchCategoryId to ObjectId (only if non-empty string)
         {
             "$addFields": {
                 "batchCategoryIdObj": {
                     "$cond": {
-                        "if": {"$eq": [{"$type": "$batchCategoryId"}, "string"]},
+                        "if": {
+                            "$and": [
+                                {"$eq": [{"$type": "$batchCategoryId"}, "string"]},
+                                {"$ne": ["$batchCategoryId", ""]}
+                            ]
+                        },
                         "then": {"$toObjectId": "$batchCategoryId"},
                         "else": "$batchCategoryId"
                     }
                 }
             }
         },
+        # Lookup category info
         {
             "$lookup": {
                 "from": "batchcategories",
@@ -104,7 +118,13 @@ def fetch_batches():
                 "endDate": 1,
                 "isActive": 1,
                 "batchCategoryId": {"$toString": "$batchCategoryId"},
-                "categoryName": "$categoryInfo.name"
+                # Use 'name' first, fall back to 'title' if name doesn't exist
+                "categoryName": {
+                    "$ifNull": [
+                        "$categoryInfo.name",
+                        "$categoryInfo.title"
+                    ]
+                }
             }
         }
     ]
@@ -116,15 +136,15 @@ def fetch_batches():
             'batch_id': str(b['_id']),
             'batch_name': b.get('name', 'Unknown'),
             'category_id': b.get('batchCategoryId', ''),
-            'category_name': b.get('categoryName', 'Unknown'),
-            'start_date': pd.to_datetime(b.get('startDate'), errors='coerce'),
-            'end_date': pd.to_datetime(b.get('endDate'), errors='coerce'),
+            'category_name': b.get('categoryName') if b.get('categoryName') else 'Unknown',
+            'start_date': pd.to_datetime(b.get("startDate"), errors="coerce", dayfirst=True),
+            'end_date': pd.to_datetime(b.get("endDate"), errors="coerce", dayfirst=True),
             'is_active': b.get('isActive', False)
         }
         for b in batches
     ])
     
-    # Filter out testing categories
+    # Filter out testing categories (matches both name and title containing 'testing')
     if not df.empty:
         df = df[~df['category_name'].fillna('').str.contains('testing', case=False, na=False)]
     
@@ -195,8 +215,8 @@ def fetch_sessions(batch_id=None):
             'session_id': str(s['_id']),
             'batch_id': str(s['batch_id']),
             'title': s.get('title', 'Unknown'),
-            'start_date': pd.to_datetime(s.get('start_date'), errors='coerce'),
-            'end_date': pd.to_datetime(s.get('end_date'), errors='coerce')
+            'start_date': pd.to_datetime(s.get("start_date"), errors="coerce", dayfirst=True),
+            'end_date': pd.to_datetime(s.get("end_date"), errors="coerce", dayfirst=True)
         }
         for s in sessions
     ])
@@ -280,7 +300,7 @@ def fetch_session_users(session_id):
             'name': u.get('userName', 'Unknown'),
             'mobile': u.get('mobileNumber', ''),
             'email': u.get('email', ''),
-            'attended_at': pd.to_datetime(u.get('joined_at'), errors='coerce')
+            'attended_at': pd.to_datetime(u.get("joined_at"), errors="coerce", dayfirst=True)
         }
         for u in users
     ])
@@ -326,7 +346,7 @@ def fetch_batch_enrolled_users(batch_id):
             'name': u.get('userName', 'Unknown'),
             'mobile': u.get('mobileNumber', ''),
             'email': u.get('email', ''),
-            'enrolled_at': pd.to_datetime(u.get('joined_on'), errors='coerce'),
+            'enrolled_at': pd.to_datetime(u.get("joined_on"), errors="coerce", dayfirst=True),
             'is_active': u.get('isActive', False)
         }
         for u in users
@@ -623,7 +643,61 @@ def main():
                 
                 # Table
                 st.markdown("### 📋 Session Details")
-                display_df = sessions_df[[
+                
+                # Filter and Sort options for Sessions
+                st.markdown("#### 🔍 Filter & Sort Sessions")
+                col_f1, col_f2, col_f3 = st.columns(3)
+                
+                with col_f1:
+                    session_search = st.text_input(
+                        "Search session by name:",
+                        placeholder="Type session title...",
+                        key="session_search"
+                    )
+                
+                with col_f2:
+                    session_sort_by = st.selectbox(
+                        "Sort by:",
+                        options=["Session #", "Session Title", "Date", "Attendees (High to Low)", "Attendees (Low to High)", "Attendance % (High to Low)", "Attendance % (Low to High)"],
+                        key="session_sort"
+                    )
+                
+                with col_f3:
+                    min_attendance = st.number_input(
+                        "Min attendance count:",
+                        min_value=0,
+                        value=0,
+                        step=1,
+                        key="min_attendance_filter"
+                    )
+                
+                # Apply filters
+                filtered_sessions = sessions_df.copy()
+                if session_search:
+                    filtered_sessions = filtered_sessions[
+                        filtered_sessions['title'].str.contains(session_search, case=False, na=False)
+                    ]
+                if min_attendance > 0:
+                    filtered_sessions = filtered_sessions[
+                        filtered_sessions['attendance_count'] >= min_attendance
+                    ]
+                
+                # Apply sort
+                session_sort_map = {
+                    "Session #": ("session_num", True),
+                    "Session Title": ("title", True),
+                    "Date": ("start_date", True),
+                    "Attendees (High to Low)": ("attendance_count", False),
+                    "Attendees (Low to High)": ("attendance_count", True),
+                    "Attendance % (High to Low)": ("attendance_pct", False),
+                    "Attendance % (Low to High)": ("attendance_pct", True),
+                }
+                sort_col, ascending = session_sort_map[session_sort_by]
+                filtered_sessions = filtered_sessions.sort_values(sort_col, ascending=ascending)
+                
+                st.info(f"Showing {len(filtered_sessions)} of {len(sessions_df)} sessions")
+                
+                display_df = filtered_sessions[[
                     'session_num', 'title', 'start_date',
                     'attendance_count', 'attendance_pct'
                 ]].copy()
@@ -641,19 +715,101 @@ def main():
                     }
                 )
                 
-                # Click to see users
-                st.markdown("### 👥 View Session Attendees")
-                selected_session = st.selectbox(
-                    "Select session to view attendees:",
-                    options=sessions_df['session_id'].tolist(),
-                    format_func=lambda x: f"Session {sessions_df[sessions_df['session_id']==x]['session_num'].iloc[0]} - {sessions_df[sessions_df['session_id']==x]['title'].iloc[0]}"
+                # Download sessions
+                sessions_csv = display_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Sessions as CSV",
+                    data=sessions_csv,
+                    file_name=f"sessions_{batch_info['batch_name'].replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    key="download_sessions"
                 )
+                
+                # Click to see users
+                st.markdown("---")
+                st.markdown("### 👥 View Session Attendees")
+                
+                # Use filtered sessions for the dropdown
+                if not filtered_sessions.empty:
+                    selected_session = st.selectbox(
+                        "Select session to view attendees:",
+                        options=filtered_sessions['session_id'].tolist(),
+                        format_func=lambda x: f"Session {filtered_sessions[filtered_sessions['session_id']==x]['session_num'].iloc[0]} - {filtered_sessions[filtered_sessions['session_id']==x]['title'].iloc[0]}"
+                    )
+                else:
+                    selected_session = None
+                    st.info("No sessions match your filters")
                 
                 if selected_session:
                     session_users = fetch_session_users(selected_session)
+                    
                     if not session_users.empty:
+                        # Filter and Sort options for Attendees
+                        st.markdown("#### 🔍 Filter & Sort Attendees")
+                        col_u1, col_u2, col_u3 = st.columns(3)
+                        
+                        with col_u1:
+                            user_search = st.text_input(
+                                "Search by name, mobile, email:",
+                                placeholder="Type to search...",
+                                key="attendee_search"
+                            )
+                        
+                        with col_u2:
+                            user_sort_by = st.selectbox(
+                                "Sort attendees by:",
+                                options=["Name (A-Z)", "Name (Z-A)", "Attended Time (Newest)", "Attended Time (Oldest)", "Mobile"],
+                                key="attendee_sort"
+                            )
+                        
+                        with col_u3:
+                            # Date filter
+                            date_filter = st.selectbox(
+                                "Filter by date:",
+                                options=["All time", "Today", "Last 7 days", "Last 30 days"],
+                                key="attendee_date_filter"
+                            )
+                        
+                        # Apply filters
+                        filtered_users = session_users.copy()
+                        
+                        # Search filter
+                        if user_search:
+                            filtered_users = filtered_users[
+                                filtered_users['name'].str.contains(user_search, case=False, na=False) |
+                                filtered_users['mobile'].astype(str).str.contains(user_search, case=False, na=False) |
+                                filtered_users['email'].str.contains(user_search, case=False, na=False)
+                            ]
+                        
+                        # Date filter
+                        if date_filter != "All time" and 'attended_at' in filtered_users.columns:
+                            now = pd.Timestamp.now(tz='UTC')
+                            if date_filter == "Today":
+                                cutoff = now.normalize()
+                            elif date_filter == "Last 7 days":
+                                cutoff = now - pd.Timedelta(days=7)
+                            elif date_filter == "Last 30 days":
+                                cutoff = now - pd.Timedelta(days=30)
+                            
+                            # Ensure attended_at is timezone-aware for comparison
+                            attended_at_tz = pd.to_datetime(filtered_users['attended_at'], utc=True, errors='coerce')
+                            filtered_users = filtered_users[attended_at_tz >= cutoff]
+                        
+                        # Apply sort
+                        user_sort_map = {
+                            "Name (A-Z)": ("name", True),
+                            "Name (Z-A)": ("name", False),
+                            "Attended Time (Newest)": ("attended_at", False),
+                            "Attended Time (Oldest)": ("attended_at", True),
+                            "Mobile": ("mobile", True),
+                        }
+                        sort_col, ascending = user_sort_map[user_sort_by]
+                        filtered_users = filtered_users.sort_values(sort_col, ascending=ascending)
+                        
+                        st.info(f"Showing {len(filtered_users)} of {len(session_users)} attendees")
+                        
                         st.dataframe(
-                            session_users,
+                            filtered_users,
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -662,6 +818,17 @@ def main():
                                 'email': 'Email',
                                 'attended_at': st.column_config.DatetimeColumn('Attended At'),
                             }
+                        )
+                        
+                        # Download attendees
+                        attendees_csv = filtered_users.to_csv(index=False)
+                        session_title = filtered_sessions[filtered_sessions['session_id']==selected_session]['title'].iloc[0]
+                        st.download_button(
+                            label="📥 Download Attendees as CSV",
+                            data=attendees_csv,
+                            file_name=f"attendees_{session_title.replace(' ', '_')}.csv",
+                            mime="text/csv",
+                            key="download_attendees"
                         )
                     else:
                         st.info("No attendees yet for this session")
